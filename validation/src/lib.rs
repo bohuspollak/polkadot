@@ -34,12 +34,11 @@ use std::{
 	sync::Arc,
 };
 use codec::Encode;
-use polkadot_primitives::Hash;
 use polkadot_primitives::parachain::{
 	Id as ParaId, Chain, DutyRoster, AbridgedCandidateReceipt,
 	Statement as PrimitiveStatement,
 	PoVBlock, ErasureChunk, ValidatorSignature, ValidatorIndex,
-	ValidatorPair, ValidatorId,
+	ValidatorPair, ValidatorId, SigningContext,
 };
 use primitives::Pair;
 
@@ -55,7 +54,7 @@ pub use self::shared_table::{
 pub use self::validation_service::{ServiceHandle, ServiceBuilder};
 
 #[cfg(not(target_os = "unknown"))]
-pub use parachain::wasm_executor::{run_worker as run_validation_worker};
+pub use parachain::wasm_executor::run_worker as run_validation_worker;
 
 mod dynamic_inclusion;
 mod error;
@@ -109,6 +108,7 @@ pub trait Network {
 
 	/// Instantiate a table router using the given shared table.
 	/// Also pass through any outgoing messages to be broadcast to peers.
+	#[must_use]
 	fn build_table_router(
 		&self,
 		table: Arc<SharedTable>,
@@ -135,9 +135,13 @@ pub struct GroupInfo {
 /// Sign a table statement against a parent hash.
 /// The actual message signed is the encoded statement concatenated with the
 /// parent hash.
-pub fn sign_table_statement(statement: &Statement, key: &ValidatorPair, parent_hash: &Hash) -> ValidatorSignature {
+pub fn sign_table_statement(
+	statement: &Statement,
+	key: &ValidatorPair,
+	signing_context: &SigningContext,
+) -> ValidatorSignature {
 	let mut encoded = PrimitiveStatement::from(statement).encode();
-	encoded.extend(parent_hash.as_ref());
+	encoded.extend(signing_context.encode());
 
 	key.sign(&encoded)
 }
@@ -147,12 +151,12 @@ pub fn check_statement(
 	statement: &Statement,
 	signature: &ValidatorSignature,
 	signer: ValidatorId,
-	parent_hash: &Hash,
+	signing_context: &SigningContext,
 ) -> bool {
 	use runtime_primitives::traits::AppVerify;
 
 	let mut encoded = PrimitiveStatement::from(statement).encode();
-	encoded.extend(parent_hash.as_ref());
+	encoded.extend(signing_context.encode());
 
 	signature.verify(&encoded[..], &signer)
 }
@@ -214,11 +218,19 @@ mod tests {
 	fn sign_and_check_statement() {
 		let statement: Statement = GenericStatement::Valid([1; 32].into());
 		let parent_hash = [2; 32].into();
+		let signing_context = SigningContext {
+			session_index: Default::default(),
+			parent_hash,
+		};
 
-		let sig = sign_table_statement(&statement, &Sr25519Keyring::Alice.pair().into(), &parent_hash);
+		let sig = sign_table_statement(&statement, &Sr25519Keyring::Alice.pair().into(), &signing_context);
 
-		assert!(check_statement(&statement, &sig, Sr25519Keyring::Alice.public().into(), &parent_hash));
-		assert!(!check_statement(&statement, &sig, Sr25519Keyring::Alice.public().into(), &[0xff; 32].into()));
-		assert!(!check_statement(&statement, &sig, Sr25519Keyring::Bob.public().into(), &parent_hash));
+		let wrong_signing_context = SigningContext {
+			session_index: Default::default(),
+			parent_hash: [0xff; 32].into(),
+		};
+		assert!(check_statement(&statement, &sig, Sr25519Keyring::Alice.public().into(), &signing_context));
+		assert!(!check_statement(&statement, &sig, Sr25519Keyring::Alice.public().into(), &wrong_signing_context));
+		assert!(!check_statement(&statement, &sig, Sr25519Keyring::Bob.public().into(), &signing_context));
 	}
 }

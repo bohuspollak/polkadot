@@ -67,20 +67,21 @@
 //! funds ultimately end up in module's fund sub-account.
 
 use frame_support::{
-	decl_module, decl_storage, decl_event, decl_error, storage::child, ensure, traits::{
+	decl_module, decl_storage, decl_event, decl_error, storage::child, ensure,
+	traits::{
 		Currency, Get, OnUnbalanced, WithdrawReason, ExistenceRequirement::AllowDeath
-	}
+	},
+	weights::{MINIMUM_WEIGHT, SimpleDispatchInfo},
 };
 use system::ensure_signed;
 use sp_runtime::{ModuleId,
 	traits::{AccountIdConversion, Hash, Saturating, Zero, CheckedAdd}
 };
-use frame_support::weights::SimpleDispatchInfo;
 use crate::slots;
 use codec::{Encode, Decode};
 use sp_std::vec::Vec;
 use sp_core::storage::well_known_keys::CHILD_STORAGE_KEY_PREFIX;
-use primitives::parachain::Id as ParaId;
+use primitives::parachain::{Id as ParaId, HeadData};
 
 const MODULE_ID: ModuleId = ModuleId(*b"py/cfund");
 
@@ -124,7 +125,7 @@ pub enum LastContribution<BlockNumber> {
 struct DeployData<Hash> {
 	code_hash: Hash,
 	code_size: u32,
-	initial_head_data: Vec<u8>,
+	initial_head_data: HeadData,
 }
 
 #[derive(Encode, Decode, Clone, PartialEq, Eq)]
@@ -166,19 +167,19 @@ pub struct FundInfo<AccountId, Balance, Hash, BlockNumber> {
 decl_storage! {
 	trait Store for Module<T: Trait> as Crowdfund {
 		/// Info on all of the funds.
-		Funds get(funds):
+		Funds get(fn funds):
 			map hasher(twox_64_concat) FundIndex
 			=> Option<FundInfo<T::AccountId, BalanceOf<T>, T::Hash, T::BlockNumber>>;
 
 		/// The total number of funds that have so far been allocated.
-		FundCount get(fund_count): FundIndex;
+		FundCount get(fn fund_count): FundIndex;
 
 		/// The funds that have had additional contributions during the last block. This is used
 		/// in order to determine which funds should submit new or updated bids.
-		NewRaise get(new_raise): Vec<FundIndex>;
+		NewRaise get(fn new_raise): Vec<FundIndex>;
 
 		/// The number of auctions that have entered into their ending period so far.
-		EndingsCount get(endings_count): slots::AuctionIndex;
+		EndingsCount get(fn endings_count): slots::AuctionIndex;
 	}
 }
 
@@ -250,7 +251,7 @@ decl_module! {
 		fn deposit_event() = default;
 
 		/// Create a new crowdfunding campaign for a parachain slot deposit for the current auction.
-		#[weight = SimpleDispatchInfo::FixedNormal(100_000)]
+		#[weight = SimpleDispatchInfo::FixedNormal(100_000_000)]
 		fn create(origin,
 			#[compact] cap: BalanceOf<T>,
 			#[compact] first_slot: T::BlockNumber,
@@ -294,6 +295,7 @@ decl_module! {
 		/// Contribute to a crowd sale. This will transfer some balance over to fund a parachain
 		/// slot. It will be withdrawable in two instances: the parachain becomes retired; or the
 		/// slot is unable to be purchased and the timeout expires.
+		#[weight = SimpleDispatchInfo::FixedNormal(MINIMUM_WEIGHT)]
 		fn contribute(origin, #[compact] index: FundIndex, #[compact] value: BalanceOf<T>) {
 			let who = ensure_signed(origin)?;
 
@@ -352,11 +354,12 @@ decl_module! {
 		/// - `index` is the fund index that `origin` owns and whose deploy data will be set.
 		/// - `code_hash` is the hash of the parachain's Wasm validation function.
 		/// - `initial_head_data` is the parachain's initial head data.
+		#[weight = SimpleDispatchInfo::FixedNormal(MINIMUM_WEIGHT)]
 		fn fix_deploy_data(origin,
 			#[compact] index: FundIndex,
 			code_hash: T::Hash,
 			code_size: u32,
-			initial_head_data: Vec<u8>
+			initial_head_data: HeadData,
 		) {
 			let who = ensure_signed(origin)?;
 
@@ -377,6 +380,7 @@ decl_module! {
 		///
 		/// - `index` is the fund index that `origin` owns and whose deploy data will be set.
 		/// - `para_id` is the parachain index that this fund won.
+		#[weight = SimpleDispatchInfo::FixedNormal(MINIMUM_WEIGHT)]
 		fn onboard(origin,
 			#[compact] index: FundIndex,
 			#[compact] para_id: ParaId
@@ -405,6 +409,7 @@ decl_module! {
 		}
 
 		/// Note that a successful fund has lost its parachain slot, and place it into retirement.
+		#[weight = SimpleDispatchInfo::FixedNormal(MINIMUM_WEIGHT)]
 		fn begin_retirement(origin, #[compact] index: FundIndex) {
 			let _ = ensure_signed(origin)?;
 
@@ -426,6 +431,7 @@ decl_module! {
 		}
 
 		/// Withdraw full balance of a contributor to an unsuccessful or off-boarded fund.
+		#[weight = SimpleDispatchInfo::FixedNormal(MINIMUM_WEIGHT)]
 		fn withdraw(origin, #[compact] index: FundIndex) {
 			let who = ensure_signed(origin)?;
 
@@ -456,6 +462,7 @@ decl_module! {
 		/// Remove a fund after either: it was unsuccessful and it timed out; or it was successful
 		/// but it has been retired from its parachain slot. This places any deposits that were not
 		/// withdrawn into the treasury.
+		#[weight = SimpleDispatchInfo::FixedNormal(MINIMUM_WEIGHT)]
 		fn dissolve(origin, #[compact] index: FundIndex) {
 			let _ = ensure_signed(origin)?;
 
@@ -570,15 +577,18 @@ mod tests {
 	use super::*;
 
 	use std::{collections::HashMap, cell::RefCell};
-	use frame_support::{impl_outer_origin, assert_ok, assert_noop, parameter_types};
+	use frame_support::{
+		impl_outer_origin, assert_ok, assert_noop, parameter_types,
+		traits::{OnInitialize, OnFinalize},
+	};
 	use frame_support::traits::Contains;
 	use sp_core::H256;
-	use primitives::parachain::{Info as ParaInfo, Id as ParaId};
+	use primitives::parachain::{Info as ParaInfo, Id as ParaId, Scheduling, ValidationCode};
 	// The testing primitives are very useful for avoiding having to work with signatures
 	// or public keys. `u64` is used as the `AccountId` and no `Signature`s are requried.
 	use sp_runtime::{
 		Perbill, Permill, Percent, testing::Header, DispatchResult,
-		traits::{BlakeTwo256, OnInitialize, OnFinalize, IdentityLookup},
+		traits::{BlakeTwo256, IdentityLookup},
 	};
 	use crate::registrar::Registrar;
 
@@ -610,12 +620,13 @@ mod tests {
 		type Event = ();
 		type BlockHashCount = BlockHashCount;
 		type MaximumBlockWeight = MaximumBlockWeight;
+		type DbWeight = ();
 		type MaximumBlockLength = MaximumBlockLength;
 		type AvailableBlockRatio = AvailableBlockRatio;
 		type Version = ();
 		type ModuleToIndex = ();
 		type AccountData = balances::AccountData<u64>;
-		type MigrateAccount = (); type OnNewAccount = ();
+		type OnNewAccount = ();
 		type OnKilledAccount = Balances;
 	}
 	parameter_types! {
@@ -643,6 +654,8 @@ mod tests {
 	impl Contains<u64> for Nobody {
 		fn contains(_: &u64) -> bool { false }
 		fn sorted_members() -> Vec<u64> { vec![] }
+		#[cfg(feature = "runtime-benchmarks")]
+		fn add(_: &u64) { unimplemented!() }
 	}
 	impl treasury::Trait for Test {
 		type Currency = balances::Module<Test>;
@@ -664,7 +677,7 @@ mod tests {
 	thread_local! {
 		pub static PARACHAIN_COUNT: RefCell<u32> = RefCell::new(0);
 		pub static PARACHAINS:
-			RefCell<HashMap<u32, (Vec<u8>, Vec<u8>)>> = RefCell::new(HashMap::new());
+			RefCell<HashMap<u32, (ValidationCode, HeadData)>> = RefCell::new(HashMap::new());
 	}
 
 	const MAX_CODE_SIZE: u32 = 100;
@@ -687,11 +700,15 @@ mod tests {
 			code_size <= MAX_CODE_SIZE
 		}
 
+		fn para_info(_id: ParaId) -> Option<ParaInfo> {
+			Some(ParaInfo { scheduling: Scheduling::Always })
+		}
+
 		fn register_para(
 			id: ParaId,
 			_info: ParaInfo,
-			code: Vec<u8>,
-			initial_head_data: Vec<u8>
+			code: ValidationCode,
+			initial_head_data: HeadData,
 		) -> DispatchResult {
 			PARACHAINS.with(|p| {
 				if p.borrow().contains_key(&id.into()) {
@@ -776,7 +793,7 @@ mod tests {
 	#[test]
 	fn basic_setup_works() {
 		new_test_ext().execute_with(|| {
-			assert_eq!(System::block_number(), 1);
+			assert_eq!(System::block_number(), 0);
 			assert_eq!(Crowdfund::fund_count(), 0);
 			assert_eq!(Crowdfund::funds(0), None);
 			let empty: Vec<FundIndex> = Vec::new();
@@ -904,7 +921,7 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]
+				vec![0].into()
 			));
 
 			let fund = Crowdfund::funds(0).unwrap();
@@ -915,7 +932,7 @@ mod tests {
 				Some(DeployData {
 					code_hash: <Test as system::Trait>::Hash::default(),
 					code_size: 0,
-					initial_head_data: vec![0],
+					initial_head_data: vec![0].into(),
 				}),
 			);
 		});
@@ -934,7 +951,7 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]),
+				vec![0].into()),
 				Error::<Test>::InvalidOrigin
 			);
 
@@ -944,7 +961,7 @@ mod tests {
 				1,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]),
+				vec![0].into()),
 				Error::<Test>::InvalidFundIndex
 			);
 
@@ -954,7 +971,7 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]
+				vec![0].into(),
 			));
 
 			assert_noop!(Crowdfund::fix_deploy_data(
@@ -962,7 +979,7 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![1]),
+				vec![1].into()),
 				Error::<Test>::ExistingDeployData
 			);
 		});
@@ -982,7 +999,7 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]
+				vec![0].into(),
 			));
 
 			// Fund crowdfund
@@ -1028,7 +1045,7 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]
+				vec![0].into(),
 			));
 
 			// Cannot onboard fund with incorrect parachain id
@@ -1056,7 +1073,7 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]
+				vec![0].into(),
 			));
 
 			// Fund crowdfund
@@ -1099,7 +1116,7 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]
+				vec![0].into(),
 			));
 
 			// Fund crowdfund
@@ -1241,7 +1258,7 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]
+				vec![0].into(),
 			));
 			assert_ok!(Crowdfund::onboard(Origin::signed(1), 0, 0.into()));
 
@@ -1270,7 +1287,7 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]
+				vec![0].into(),
 			));
 			// Move to the end of auction...
 			run_to_block(12);
@@ -1309,14 +1326,14 @@ mod tests {
 				0,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]
+				vec![0].into(),
 			));
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(2),
 				1,
 				<Test as system::Trait>::Hash::default(),
 				0,
-				vec![0]
+				vec![0].into(),
 			));
 
 			// End the current auction, fund 0 wins!

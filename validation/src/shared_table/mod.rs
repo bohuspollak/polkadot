@@ -25,7 +25,7 @@ use table::{self, Table, Context as TableContextTrait};
 use polkadot_primitives::{Block, Hash};
 use polkadot_primitives::parachain::{
 	Id as ParaId, AbridgedCandidateReceipt, ValidatorPair, ValidatorId,
-	AttestedCandidate, ParachainHost, PoVBlock, ValidatorIndex,
+	AttestedCandidate, ParachainHost, PoVBlock, ValidatorIndex, SigningContext,
 };
 
 use parking_lot::Mutex;
@@ -39,7 +39,7 @@ use self::includable::IncludabilitySender;
 use primitives::Pair;
 use sp_api::ProvideRuntimeApi;
 
-use crate::pipeline::FullOutput;
+use crate::pipeline::{FullOutput, ValidationPool};
 use crate::Error;
 
 mod includable;
@@ -48,7 +48,7 @@ pub use table::{SignedStatement, Statement};
 pub use table::generic::Statement as GenericStatement;
 
 struct TableContext {
-	parent_hash: Hash,
+	signing_context: SigningContext,
 	key: Option<Arc<ValidatorPair>>,
 	groups: HashMap<ParaId, GroupInfo>,
 	validators: Vec<ValidatorId>,
@@ -87,7 +87,12 @@ impl TableContext {
 	fn sign_statement(&self, statement: table::Statement) -> Option<table::SignedStatement> {
 		self.local_index().and_then(move |sender|
 			self.key.as_ref()
-				.map(|key| crate::sign_table_statement(&statement, key, &self.parent_hash).into())
+				.map(|key| crate::sign_table_statement(
+						&statement,
+						key,
+						&self.signing_context,
+					).into()
+				)
 				.map(move |signature| table::SignedStatement { statement, signature, sender })
 		)
 	}
@@ -127,6 +132,7 @@ struct SharedTableInner {
 	trackers: Vec<IncludabilitySender>,
 	availability_store: AvailabilityStore,
 	validated: HashMap<Hash, ValidationWork>,
+	validation_pool: Option<ValidationPool>,
 }
 
 impl SharedTableInner {
@@ -188,8 +194,9 @@ impl SharedTableInner {
 		};
 
 		work.map(|work| ParachainWork {
+			validation_pool: self.validation_pool.clone(),
 			availability_store: self.availability_store.clone(),
-			relay_parent: context.parent_hash.clone(),
+			relay_parent: context.signing_context.parent_hash.clone(),
 			work,
 			max_block_data_size,
 			n_validators: context.validators.len(),
@@ -254,6 +261,7 @@ impl Validated {
 
 /// Future that performs parachain validation work.
 pub struct ParachainWork<Fetch> {
+	validation_pool: Option<ValidationPool>,
 	work: Work<Fetch>,
 	relay_parent: Hash,
 	availability_store: AvailabilityStore,
@@ -278,9 +286,11 @@ impl<Fetch: Future + Unpin> ParachainWork<Fetch> {
 		let n_validators = self.n_validators;
 		let expected_relay_parent = self.relay_parent;
 
+		let pool = self.validation_pool.clone();
 		let validate = move |pov_block: &PoVBlock, candidate: &AbridgedCandidateReceipt| {
 			let collation_info = candidate.to_collation_info();
 			let full_output = crate::pipeline::full_output_validation_with_api(
+				pool.as_ref(),
 				&*api,
 				&collation_info,
 				pov_block,
@@ -408,25 +418,27 @@ impl SharedTable {
 		validators: Vec<ValidatorId>,
 		groups: HashMap<ParaId, GroupInfo>,
 		key: Option<Arc<ValidatorPair>>,
-		parent_hash: Hash,
+		signing_context: SigningContext,
 		availability_store: AvailabilityStore,
 		max_block_data_size: Option<u64>,
+		validation_pool: Option<ValidationPool>,
 	) -> Self {
 		SharedTable {
-			context: Arc::new(TableContext { groups, key, parent_hash, validators: validators.clone(), }),
+			context: Arc::new(TableContext { groups, key, signing_context, validators: validators.clone(), }),
 			max_block_data_size,
 			inner: Arc::new(Mutex::new(SharedTableInner {
 				table: Table::default(),
 				validated: HashMap::new(),
 				trackers: Vec::new(),
 				availability_store,
+				validation_pool,
 			}))
 		}
 	}
 
 	/// Get the parent hash this table should hold statements localized to.
-	pub fn consensus_parent_hash(&self) -> &Hash {
-		&self.context.parent_hash
+	pub fn signing_context(&self) -> &SigningContext {
+		&self.context.signing_context
 	}
 
 	/// Get the local validator session key.
@@ -544,7 +556,7 @@ impl SharedTable {
 				validity_votes.sort_by(|(id1, _), (id2, _)| id1.cmp(id2));
 
 				let mut validator_indices = bitvec![
-					bitvec::cursor::LittleEndian, u8;
+					bitvec::order::Lsb0, u8;
 					0;
 					validity_votes.last().map(|(i, _)| i + 1).unwrap_or_default()
 				];
@@ -654,7 +666,11 @@ mod tests {
 		let mut groups = HashMap::new();
 
 		let para_id = ParaId::from(1);
-		let parent_hash = Default::default();
+		let parent_hash = Hash::default();
+		let signing_context = SigningContext {
+			session_index: Default::default(),
+			parent_hash: parent_hash.clone(),
+		};
 
 		let local_key = Sr25519Keyring::Alice.pair();
 		let local_id: ValidatorId = local_key.public().into();
@@ -673,8 +689,9 @@ mod tests {
 			[local_id, validity_other].to_vec(),
 			groups,
 			Some(local_key.clone()),
-			parent_hash,
+			signing_context.clone(),
 			AvailabilityStore::new_in_memory(DummyErasureNetworking),
+			None,
 			None,
 		);
 
@@ -684,7 +701,11 @@ mod tests {
 
 		let candidate_statement = GenericStatement::Candidate(candidate);
 
-		let signature = crate::sign_table_statement(&candidate_statement, &validity_other_key.into(), &parent_hash);
+		let signature = crate::sign_table_statement(
+			&candidate_statement,
+			&validity_other_key.into(),
+			&signing_context,
+		);
 		let signed_statement = ::table::generic::SignedStatement {
 			statement: candidate_statement,
 			signature: signature.into(),
@@ -702,7 +723,11 @@ mod tests {
 		let mut groups = HashMap::new();
 
 		let para_id = ParaId::from(1);
-		let parent_hash = Default::default();
+		let parent_hash = Hash::default();
+		let signing_context = SigningContext {
+			session_index: Default::default(),
+			parent_hash: parent_hash.clone(),
+		};
 
 		let local_key = Sr25519Keyring::Alice.pair();
 		let local_id: ValidatorId = local_key.public().into();
@@ -721,8 +746,9 @@ mod tests {
 			[local_id, validity_other].to_vec(),
 			groups,
 			Some(local_key.clone()),
-			parent_hash,
+			signing_context.clone(),
 			AvailabilityStore::new_in_memory(DummyErasureNetworking),
+			None,
 			None,
 		);
 
@@ -732,7 +758,11 @@ mod tests {
 
 		let candidate_statement = GenericStatement::Candidate(candidate);
 
-		let signature = crate::sign_table_statement(&candidate_statement, &validity_other_key.into(), &parent_hash);
+		let signature = crate::sign_table_statement(
+			&candidate_statement,
+			&validity_other_key.into(),
+			&signing_context,
+		);
 		let signed_statement = ::table::generic::SignedStatement {
 			statement: candidate_statement,
 			signature: signature.into(),
@@ -777,6 +807,7 @@ mod tests {
 			availability_store: store.clone(),
 			max_block_data_size: None,
 			n_validators,
+			validation_pool: None,
 		};
 
 		for i in 0..n_validators {
@@ -846,6 +877,7 @@ mod tests {
 			availability_store: store.clone(),
 			max_block_data_size: None,
 			n_validators,
+			validation_pool: None,
 		};
 
 		let validated = block_on(producer.prime_with(|_, _| Ok(
@@ -874,7 +906,11 @@ mod tests {
 		let mut groups = HashMap::new();
 
 		let para_id = ParaId::from(1);
-		let parent_hash = Default::default();
+		let parent_hash = Hash::default();
+		let signing_context = SigningContext {
+			session_index: Default::default(),
+			parent_hash: parent_hash.clone(),
+		};
 
 		let local_key = Sr25519Keyring::Alice.pair();
 		let local_id: ValidatorId = local_key.public().into();
@@ -893,8 +929,9 @@ mod tests {
 			[local_id, validity_other].to_vec(),
 			groups,
 			Some(local_key.clone()),
-			parent_hash,
+			signing_context.clone(),
 			AvailabilityStore::new_in_memory(DummyErasureNetworking),
+			None,
 			None,
 		);
 
@@ -905,7 +942,11 @@ mod tests {
 		let candidate_hash = candidate.hash();
 		let candidate_statement = GenericStatement::Candidate(candidate);
 
-		let signature = crate::sign_table_statement(&candidate_statement, &validity_other_key.into(), &parent_hash);
+		let signature = crate::sign_table_statement(
+			&candidate_statement,
+			&validity_other_key.into(),
+			&signing_context,
+		);
 		let signed_statement = ::table::generic::SignedStatement {
 			statement: candidate_statement,
 			signature: signature.into(),
@@ -934,7 +975,11 @@ mod tests {
 
 		let para_id = ParaId::from(1);
 		let pov_block = pov_block_with_data(vec![1, 2, 3]);
-		let parent_hash = Default::default();
+		let parent_hash = Hash::default();
+		let signing_context = SigningContext {
+			session_index: Default::default(),
+			parent_hash: parent_hash.clone(),
+		};
 
 		let local_key = Sr25519Keyring::Alice.pair();
 		let local_id: ValidatorId = local_key.public().into();
@@ -952,8 +997,9 @@ mod tests {
 			[local_id, validity_other].to_vec(),
 			groups,
 			Some(local_key.clone()),
-			parent_hash,
+			signing_context.clone(),
 			AvailabilityStore::new_in_memory(DummyErasureNetworking),
+			None,
 			None,
 		);
 

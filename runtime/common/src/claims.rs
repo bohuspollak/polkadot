@@ -29,8 +29,9 @@ use serde::{self, Serialize, Deserialize, Serializer, Deserializer};
 use sp_runtime::traits::Zero;
 use sp_runtime::traits::CheckedSub;
 use sp_runtime::{
-	RuntimeDebug, transaction_validity::{
-		TransactionLongevity, TransactionValidity, ValidTransaction, InvalidTransaction
+	RuntimeDebug,
+	transaction_validity::{
+		TransactionLongevity, TransactionValidity, ValidTransaction, InvalidTransaction, TransactionSource,
 	},
 };
 use primitives::ValidityError;
@@ -122,35 +123,22 @@ decl_storage! {
 	// This allows for type-safe usage of the Substrate storage database, so you can
 	// keep things around between blocks.
 	trait Store for Module<T: Trait> as Claims {
-		Claims get(claims) build(|config: &GenesisConfig<T>| {
+		Claims get(fn claims) build(|config: &GenesisConfig<T>| {
 			config.claims.iter().map(|(a, b)| (a.clone(), b.clone())).collect::<Vec<_>>()
 		}): map hasher(identity) EthereumAddress => Option<BalanceOf<T>>;
-		Total get(total) build(|config: &GenesisConfig<T>| {
+		Total get(fn total) build(|config: &GenesisConfig<T>| {
 			config.claims.iter().fold(Zero::zero(), |acc: BalanceOf<T>, &(_, n)| acc + n)
 		}): BalanceOf<T>;
 		/// Vesting schedule for a claim.
 		/// First balance is the total amount that should be held for vesting.
 		/// Second balance is how much should be unlocked per block.
 		/// The block number is when the vesting should start.
-		Vesting get(vesting) config():
+		Vesting get(fn vesting) config():
 			map hasher(identity) EthereumAddress
 			=> Option<(BalanceOf<T>, BalanceOf<T>, T::BlockNumber)>;
 	}
 	add_extra_genesis {
 		config(claims): Vec<(EthereumAddress, BalanceOf<T>)>;
-	}
-}
-
-mod migration {
-	use super::*;
-
-	pub fn migrate<T: Trait>() {
-		if let Ok(addresses) = Vec::<EthereumAddress>::decode(&mut &include_bytes!("./claims.scale")[..]) {
-			for i in &addresses {
-				Vesting::<T>::migrate_key_from_blake(i);
-				Claims::<T>::migrate_key_from_blake(i);
-			}
-		}
 	}
 }
 
@@ -163,10 +151,6 @@ decl_module! {
 
 		/// Deposit one of this module's events by using the default implementation.
 		fn deposit_event() = default;
-
-		fn on_runtime_upgrade() {
-			migration::migrate::<T>();
-		}
 
 		/// Make a claim to collect your DOTs.
 		///
@@ -200,7 +184,7 @@ decl_module! {
 		///
 		/// Total Complexity: O(1)
 		/// </weight>
-		#[weight = SimpleDispatchInfo::FixedNormal(1_000_000)]
+		#[weight = SimpleDispatchInfo::FixedNormal(1_000_000_000)]
 		fn claim(origin, dest: T::AccountId, ethereum_signature: EcdsaSignature) {
 			ensure_none(origin)?;
 
@@ -247,7 +231,7 @@ decl_module! {
 		///
 		/// Total Complexity: O(1)
 		/// </weight>
-		#[weight = SimpleDispatchInfo::FixedNormal(30_000)]
+		#[weight = SimpleDispatchInfo::FixedNormal(30_000_000)]
 		fn mint_claim(origin,
 			who: EthereumAddress,
 			value: BalanceOf<T>,
@@ -302,11 +286,10 @@ impl<T: Trait> Module<T> {
 	}
 }
 
-#[allow(deprecated)] // Allow `ValidateUnsigned`
 impl<T: Trait> sp_runtime::traits::ValidateUnsigned for Module<T> {
 	type Call = Call<T>;
 
-	fn validate_unsigned(call: &Self::Call) -> TransactionValidity {
+	fn validate_unsigned(_source: TransactionSource, call: &Self::Call) -> TransactionValidity {
 		const PRIORITY: u64 = 100;
 
 		match call {
@@ -407,12 +390,13 @@ mod tests {
 		type Event = ();
 		type BlockHashCount = BlockHashCount;
 		type MaximumBlockWeight = MaximumBlockWeight;
+		type DbWeight = ();
 		type MaximumBlockLength = MaximumBlockLength;
 		type AvailableBlockRatio = AvailableBlockRatio;
 		type Version = ();
 		type ModuleToIndex = ();
 		type AccountData = balances::AccountData<u64>;
-		type MigrateAccount = (); type OnNewAccount = ();
+		type OnNewAccount = ();
 		type OnKilledAccount = Balances;
 	}
 
@@ -625,10 +609,11 @@ mod tests {
 	#[test]
 	fn validate_unsigned_works() {
 		use sp_runtime::traits::ValidateUnsigned;
+		let source = sp_runtime::transaction_validity::TransactionSource::External;
 
 		new_test_ext().execute_with(|| {
 			assert_eq!(
-				<Module<Test>>::validate_unsigned(&Call::claim(1, sig::<Test>(&alice(), &1u64.encode()))),
+				<Module<Test>>::validate_unsigned(source, &Call::claim(1, sig::<Test>(&alice(), &1u64.encode()))),
 				Ok(ValidTransaction {
 					priority: 100,
 					requires: vec![],
@@ -638,15 +623,15 @@ mod tests {
 				})
 			);
 			assert_eq!(
-				<Module<Test>>::validate_unsigned(&Call::claim(0, EcdsaSignature([0; 65]))),
+				<Module<Test>>::validate_unsigned(source, &Call::claim(0, EcdsaSignature([0; 65]))),
 				InvalidTransaction::Custom(ValidityError::InvalidEthereumSignature.into()).into(),
 			);
 			assert_eq!(
-				<Module<Test>>::validate_unsigned(&Call::claim(1, sig::<Test>(&bob(), &1u64.encode()))),
+				<Module<Test>>::validate_unsigned(source, &Call::claim(1, sig::<Test>(&bob(), &1u64.encode()))),
 				InvalidTransaction::Custom(ValidityError::SignerHasNoClaim.into()).into(),
 			);
 			assert_eq!(
-				<Module<Test>>::validate_unsigned(&Call::claim(0, sig::<Test>(&bob(), &1u64.encode()))),
+				<Module<Test>>::validate_unsigned(source, &Call::claim(0, sig::<Test>(&bob(), &1u64.encode()))),
 				InvalidTransaction::Custom(ValidityError::SignerHasNoClaim.into()).into(),
 			);
 		});
@@ -658,6 +643,7 @@ mod benchmarking {
 	use super::*;
 	use secp_utils::*;
 	use system::RawOrigin;
+	use system as frame_system; // NOTE: required for the benchmarks! macro
 	use frame_benchmarking::{benchmarks, account};
 	use sp_runtime::DispatchResult;
 	use sp_runtime::traits::ValidateUnsigned;
@@ -708,8 +694,9 @@ mod benchmarking {
 			let account: T::AccountId = account("user", c, SEED);
 			let signature = sig::<T>(&secret_key, &account.encode());
 			let call = Call::<T>::claim(account, signature);
+			let source = sp_runtime::transaction_validity::TransactionSource::External;
 		}: {
-			super::Module::<T>::validate_unsigned(&call)?
+			super::Module::<T>::validate_unsigned(source, &call)?
 		}
 
 		// Benchmark the time it takes to do `repeat` number of keccak256 hashes
